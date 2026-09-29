@@ -1,0 +1,26 @@
+# ---------------- 构建产物 ----------------
+# 运行程序只需要 app\ 里的内容；app\ 由 build.cmd 生成，不进版本库
+bin/
+obj/
+app/
+_*/
+*.user
+*.suo
+.vs/
+.idea/
+
+# ---------------- 运行时生成 ----------------
+# 配置里有本机的显示器设备名等，属于个人环境数据
+config.json
+SysMonitorBar.log
+
+# ---------------- 本机专用 ----------------
+# build.ps1 会读这个文件拿 SDK 路径，属于各人机器自己的配置
+dotnet-path.txt
+
+# ---------------- 诊断输出 ----------------
+sensors.txt
+selftest.txt
+meminfo.txt
+preview.png
+*.tmp
