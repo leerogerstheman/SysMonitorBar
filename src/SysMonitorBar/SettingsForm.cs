@@ -58,10 +58,38 @@ internal sealed class PreviewPanel : Control
         x = Math.Max(2, Math.Min(x, Width - w - 2));
 
         var rect = new Rectangle(x, y, w, h);
+
+        // 棋盘格：让"背景透明"在预览里真的看得见，而不是显示成纯色。
+        DrawChecker(g, rect);
+
         var st = g.Save();
         g.SetClip(rect);
-        BarPainter.Paint(g, BarFont, Cfg, lines, rect, true);
+        BarPainter.Paint(g, BarFont, Cfg, lines, rect, 1.0);
         g.Restore(st);
+
+        using (var p = new Pen(Color.FromArgb(90, 255, 255, 255)))
+            g.DrawRectangle(p, rect.X, rect.Y, rect.Width - 1, rect.Height - 1);
+
+        // 全透明时给一句提示，避免用户以为预览坏了
+        if (Cfg.Back.A == 0)
+        {
+            using var f = new Font("Microsoft YaHei UI", 7.5f);
+            using var b = new SolidBrush(Color.FromArgb(230, 255, 220, 150));
+            g.DrawString("背景已设为全透明（只显示文字）", f, b, rect.X + 2, rect.Bottom + 2);
+        }
+    }
+
+    private static void DrawChecker(Graphics g, Rectangle r)
+    {
+        const int cell = 8;
+        using var light = new SolidBrush(Color.FromArgb(150, 150, 155));
+        using var dark = new SolidBrush(Color.FromArgb(105, 108, 115));
+        for (int yy = r.Top; yy < r.Bottom; yy += cell)
+            for (int xx = r.Left; xx < r.Right; xx += cell)
+            {
+                var c = ((xx / cell + yy / cell) & 1) == 0 ? light : dark;
+                g.FillRectangle(c, xx, yy, Math.Min(cell, r.Right - xx), Math.Min(cell, r.Bottom - yy));
+            }
     }
 }
 
@@ -94,6 +122,8 @@ public sealed class SettingsForm : Form
     private Control _textColorBtn, _accentColorBtn, _backColorBtn;
     private TrackBar _opacity;
     private Label _opacityLabel;
+    private TrackBar _backAlpha;
+    private Label _backAlphaLabel;
     private TextBox _separator;
     private CheckBox _hoverFade;
     private NumericUpDown _hoverOpacity;
@@ -459,16 +489,37 @@ public sealed class SettingsForm : Form
         page.Controls.AddRange(new Control[] { _textColorBtn, _accentColorBtn, _backColorBtn });
         y += 46;
 
-        page.Controls.Add(L("不透明度", 20, y));
+        // ---------- 背景不透明度（逐像素 alpha，只影响底板，文字始终清晰） ----------
+        page.Controls.Add(L("背景不透明度", 20, y));
+        _backAlpha = new TrackBar
+        {
+            Location = new Point(120, y - 6),
+            Width = 300,
+            Minimum = 0,
+            Maximum = 100,
+            TickFrequency = 10,
+        };
+        _backAlphaLabel = new Label { Location = new Point(430, y + 3), AutoSize = true };
+        _backAlpha.ValueChanged += (_, __) =>
+        {
+            var c = _draft.Back;
+            _draft.BackColor = AppConfig.ColorToHex(Color.FromArgb((int)Math.Round(_backAlpha.Value * 2.55), c.R, c.G, c.B));
+            _backAlphaLabel.Text = _backAlpha.Value == 0 ? "0%（全透明，只留文字）" : _backAlpha.Value + "%";
+            UpdatePreview();
+        };
+        page.Controls.AddRange(new Control[] { _backAlpha, _backAlphaLabel });
+        y += 52;
+
+        page.Controls.Add(L("整体不透明度", 20, y));
         _opacity = new TrackBar
         {
-            Location = new Point(90, y - 6),
+            Location = new Point(120, y - 6),
             Width = 300,
             Minimum = 20,
             Maximum = 100,
             TickFrequency = 10,
         };
-        _opacityLabel = new Label { Location = new Point(400, y + 3), AutoSize = true };
+        _opacityLabel = new Label { Location = new Point(430, y + 3), AutoSize = true };
         _opacity.ValueChanged += (_, __) =>
         {
             _draft.Opacity = _opacity.Value / 100.0;
@@ -476,7 +527,19 @@ public sealed class SettingsForm : Form
             UpdatePreview();
         };
         page.Controls.AddRange(new Control[] { _opacity, _opacityLabel });
-        y += 52;
+        y += 42;
+
+        // 说明文字用 AutoSize=false + 固定宽度，让它在面板里正常换行；
+        // 之前给了固定 Size 但没算够行数，第二行会被裁掉。
+        page.Controls.Add(new Label
+        {
+            Text = "「背景不透明度」只淡化底板，文字保持清晰；拉到 0% 就是完全透明，只剩字浮在桌面上。\r\n" +
+                   "「整体不透明度」会把文字一起淡化。两者相乘生效。",
+            Location = new Point(20, y),
+            Size = new Size(720, 40),
+            ForeColor = Color.DimGray,
+        });
+        y += 50;
 
         _radius = Num("圆角", 20, y, 0, 30, _draft.CornerRadius, v => { _draft.CornerRadius = (int)v; UpdatePreview(); }, page, out _);
         _padX = Num("左右内边距", 250, y, 0, 80, _draft.PaddingX, v => { _draft.PaddingX = (int)v; UpdatePreview(); }, page, out _);
@@ -524,7 +587,7 @@ public sealed class SettingsForm : Form
         return page;
     }
 
-    private Control ColorButton(string text, int x, int y, Func<string> get, Action<string> set)
+    private Control ColorButton(string text, int x, int y, Func<string> get, Action<string> set, bool preserveAlpha = true)
     {
         var host = new Panel { Location = new Point(x, y), Size = new Size(214, 32) };
         var b = new Button { Text = text + "…", Location = new Point(0, 0), Size = new Size(110, 30) };
@@ -538,10 +601,16 @@ public sealed class SettingsForm : Form
 
         b.Click += (_, __) =>
         {
-            using var dlg = new ColorDialog { FullOpen = true, AnyColor = true, Color = AppConfig.ParseColor(get(), Color.White) };
+            var cur = AppConfig.ParseColor(get(), Color.White);
+            using var dlg = new ColorDialog { FullOpen = true, AnyColor = true, Color = Color.FromArgb(255, cur.R, cur.G, cur.B) };
             if (dlg.ShowDialog(this) == DialogResult.OK)
             {
-                set(AppConfig.ColorToHex(Color.FromArgb(255, dlg.Color.R, dlg.Color.G, dlg.Color.B)));
+                // ⚠ 取色对话框只给 RGB。这里必须把原有的 alpha 保留回去，
+                // 否则用户一改背景色，"背景不透明度"就被悄悄清成 100% ——
+                // 之前 BackColor 会变成 #FF000000 就是这个原因。
+                int a = cur.A;
+                if (preserveAlpha == false) a = 255;
+                set(AppConfig.ColorToHex(Color.FromArgb(a, dlg.Color.R, dlg.Color.G, dlg.Color.B)));
                 Sync();
                 UpdatePreview();
             }
@@ -695,6 +764,8 @@ public sealed class SettingsForm : Form
 
             _opacity.Value = (int)Math.Round(Math.Max(0.2, Math.Min(1.0, _draft.Opacity)) * 100);
             _opacityLabel.Text = _opacity.Value + "%";
+            _backAlpha.Value = (int)Math.Round(_draft.Back.A / 2.55);
+            _backAlphaLabel.Text = _backAlpha.Value == 0 ? "0%（全透明，只留文字）" : _backAlpha.Value + "%";
             _radius.Value = Math.Max(0, Math.Min(30, _draft.CornerRadius));
             _padX.Value = Math.Max(0, Math.Min(80, _draft.PaddingX));
             _padY.Value = Math.Max(0, Math.Min(60, _draft.PaddingY));

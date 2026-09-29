@@ -22,12 +22,17 @@ Windows 10/11 · .NET 8 · WinForms · [MIT 协议](LICENSE)
 - **显示**：显示器刷新率，以及用 DXGI 桌面复制**实测**的实时帧率
 - **任意传感器**：LibreHardwareMonitor 枚举到的每个传感器（每核心频率、各路电压、主板温度、硬盘温度…）都能单独加到条上
 - **1~2 行随便排**：显示哪些数据、放第几行、什么顺序、叫什么名字、用什么模板格式，全部在设置界面里点几下搞定
+- **背景可调至全透明**：背景不透明度 0~100% 无级调节，拉到 0% 就是**只剩文字浮在桌面上**（逐像素 alpha，文字始终清晰、边缘不糊）
 - **不挡操作**：默认鼠标穿透，点击直接透到后面的窗口；鼠标移到它上面时**强烈淡化**到 15%
 - **常驻托盘**：拖动定位、字号快捷增减、开机自启（提权时创建计划任务，**开机不再弹 UAC**）
 
 鼠标移到悬浮条上时会强烈淡化：
 
 ![鼠标移入淡化](docs/效果图-鼠标移入淡化.png)
+
+背景拉到 0%（全透明）的效果 —— 文字直接浮在浏览器标签栏上，没有任何底板：
+
+![背景全透明](docs/效果图-背景全透明.png)
 
 ---
 
@@ -80,6 +85,29 @@ build.cmd             :: 需要 .NET 8 SDK，脚本会自动找
 
 注意：鼠标穿透状态下窗口收不到 `MouseEnter/Leave`，所以程序是**轮询鼠标屏幕坐标**判断的，
 穿透与否都能生效。
+
+### 调整背景透明度
+
+设置 →「外观」里有两个滑块，含义不同：
+
+| 滑块 | 范围 | 作用 |
+| --- | --- | --- |
+| **背景不透明度** | 0 ~ 100% | **只影响底板**。拉到 0% 就是完全透明，只剩文字浮在桌面上 |
+| **整体不透明度** | 20 ~ 100% | **连文字一起**淡化，用于整体存在感调节 |
+
+两者相乘生效。想做成 HUD 那种"只有字、没有底"的效果，把「背景不透明度」拉到 0% 即可，
+文字依旧是纯色不透明，不会跟着变淡。
+
+![外观设置](docs/设置-外观.png)
+
+背景是**逐像素 alpha** 渲染的，所以：
+
+- 半透明时是真的半透明（能看到后面的窗口），不是靠整体降透明度糊出来的
+- 圆角边缘带抗锯齿，透明背景下不会有锯齿或彩边
+- 文字用的是灰度抗锯齿（透明背景下用 ClearType 次像素抗锯齿会出彩边）
+
+> 小提示：全透明时文字直接压在桌面/窗口上，如果壁纸是浅色，建议把「文字颜色」调深一点，
+> 或给文字开「粗体」。
 
 ### 调整字号
 
@@ -210,12 +238,13 @@ build.cmd             :: 需要 .NET 8 SDK，脚本会自动找
   "Bold": true,
   "TextColor": "#FFE9F1FF",   // 数值颜色
   "AccentColor": "#FF6FD3FF", // 名称高亮色
-  "BackColor": "#D2101319",   // 背景色
+  "BackColor": "#D2101319",   // 背景色，8 位写法 #AARRGGBB，AA 就是背景不透明度
+                              //   前两位改成 00 即全透明（只剩文字），如 "#00101319"
   "CornerRadius": 10,
   "PaddingX": 16,
   "PaddingY": 5,
   "LineSpacing": 3,
-  "Opacity": 0.92,            // 整体不透明度
+  "Opacity": 0.92,            // 整体不透明度（连文字一起淡）
   "HoverFade": true,          // 鼠标移入时强烈淡化
   "HoverOpacity": 0.15,       // 淡化后的不透明度（0 = 完全隐形）
   "Separator": "   ",         // 项目之间的空隙
@@ -252,9 +281,11 @@ build.cmd             :: 需要 .NET 8 SDK，脚本会自动找
 - 内存：`GlobalMemoryStatusEx`
 - 网速：`NetworkInterface.GetIPStatistics()` 差分
 - 刷新率：`EnumDisplaySettings` + `GetDeviceCaps(VREFRESH)`
-- 悬浮条：无边框 `TopMost` + `WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE`，
-  圆角 Region + `Form.Opacity`，`WS_EX_TRANSPARENT` 实现鼠标穿透；
+- 悬浮条：无边框 `TopMost` + `WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_LAYERED`，
+  `WS_EX_TRANSPARENT` 实现鼠标穿透；
   鼠标移入淡化靠轮询 `Cursor.Position`（穿透时收不到鼠标消息）
+- **背景透明**：整条走 `UpdateLayeredWindow` + `Format32bppPArgb` **逐像素 alpha** 渲染，
+  文字用 GDI+ `DrawString`（灰度抗锯齿）画在透明画布上
 - 采样在后台线程（默认 1Hz），UI 用 200ms 定时器读取最新快照并按需重绘
 
 ### 踩过的坑（改代码时注意）
@@ -283,6 +314,28 @@ build.cmd             :: 需要 .NET 8 SDK，脚本会自动找
    正确做法是**记录"当前资源是用哪组参数建出来的"**（这里用 `_fontKey` 字符串），
    再和目标参数比——跟对象身份无关。
    另外 `TrayApp.ApplyNewConfig` 现在会 `CloneConfig()` 再接管，从根上避免这种别名。
+9. **想做"背景透明但文字不透明"，`Form.Opacity` 和 `TransparencyKey` 都不行。**
+   `Form.Opacity` 是**整窗均匀**淡化，文字会跟着一起淡；
+   `TransparencyKey` 只能整色抠掉，抗锯齿边缘会留一圈彩色毛边。
+   唯一正确的路子是 `UpdateLayeredWindow` + `Format32bppPArgb` 逐像素 alpha。
+   用这条路有三个必须注意的点（本项目都踩过）：
+   - **`WS_EX_LAYERED` 必须无条件加上**，否则 `UpdateLayeredWindow` 直接失败、整条不显示。
+   - **`Bitmap.GetHbitmap(Color.FromArgb(0))` 的那个参数不能省**。传 `Color.Empty` 会把
+     alpha=0 的像素填成不透明白，透明背景当场作废。
+   - **窗口位置和尺寸只能由 `UpdateLayeredWindow` 决定，别再调 `SetBounds`。**
+     ULW 会按推过去的位图尺寸改窗口矩形，而 WinForms 缓存的 `Bounds` 不会同步；
+     两边各设一次的结果是窗口 746px、底板只画 583px ——
+     症状就是"背景板缺了左边一大块、文字挤在右边"。
+   - 一旦对某窗口调过 ULW，系统就不再发 `WM_PAINT`，`Form.Opacity` 同时失效；
+     整体不透明度得自己乘进每个像素的 alpha。
+10. **`ColorDialog` 只返回 RGB，没有 alpha。** 用它改背景色时如果直接
+    `Color.FromArgb(255, ...)` 写回，用户调好的"背景不透明度"会被悄悄清成 100%。
+    本项目真实踩过：`BackColor` 被存成 `#FF000000`，透明设置凭空消失。
+    正确做法是把原有 alpha 读出来再拼回去。
+11. **首帧渲染时传感器还没有数据。** `HideUnavailable = true` 会把所有指标都滤掉，
+    `Measure()` 于是只返回内边距（实测 32px 宽），窗口就缩成一小条。
+    这不是 bug，等第一次采样完成后 `UpdateSnapshot` 会自动恢复成正确尺寸；
+    但排查时别被这个中间态误导。
 
 ### 源码结构
 
@@ -303,9 +356,9 @@ SysMonitorBar\
     DisplayFpsMonitor.cs   DXGI 桌面复制帧率监测
     ThermalZone.cs         ACPI 热区温度兜底（免管理员）
     NetMonitor.cs          网卡枚举与速率统计
-    Native.cs              P/Invoke：内存 / 刷新率 / 窗口样式 / DPI
+    Native.cs              P/Invoke：内存 / 刷新率 / 窗口样式 / DPI / 分层窗口逐像素 alpha
     BarPainter.cs          悬浮条排版与绘制（设置界面预览共用）
-    OverlayForm.cs         顶部悬浮条窗口
+    OverlayForm.cs         顶部悬浮条窗口（UpdateLayeredWindow 逐像素 alpha 渲染）
     SettingsForm.cs        设置界面
     TrayApp.cs             托盘 + 协调
     AutoStart.cs           开机自启 / 提权重启
@@ -387,6 +440,18 @@ D:\somewhere\dotnet8\dotnet.exe
 
 **Q：鼠标移到上面就看不见了？**
 这是「鼠标移入淡化」功能。设置 →「外观」里关掉，或把淡化后不透明度调高。
+
+**Q：背景怎么变成全透明 / 怎么把底板去掉？**
+设置 →「外观」→ **「背景不透明度」拉到 0%**，底板就完全没了，只剩文字。
+想要半透明就把这个滑块调到 40~80% 之间。
+
+注意区分两个滑块：**「背景不透明度」只影响底板**（文字始终清晰），
+**「整体不透明度」会把文字一起淡化**。想做 HUD 那种"只有字"的效果，调前者。
+
+**Q：全透明后字看不清？**
+文字直接压在壁纸/窗口上，浅色背景配浅色字自然看不清。
+去「外观」里把「文字颜色」调深，或者勾上「粗体」，也可以给文字加一点阴影感的深色轮廓
+——最省事的办法是留 15~30% 的背景不透明度当"底衬"。
 
 **Q：托盘菜单在哪里？**
 任务栏右下角，可能收在 `^` 折叠区里。图标是一个深色圆角方块加青色仪表弧。

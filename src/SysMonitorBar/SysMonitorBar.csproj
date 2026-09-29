@@ -24,10 +24,10 @@
     <ApplicationUseCompatibleTextRendering>false</ApplicationUseCompatibleTextRendering>
     <ApplicationDefaultFont>Microsoft YaHei UI, 9pt</ApplicationDefaultFont>
 
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
     <Product>顶部硬件监控条</Product>
     <AssemblyTitle>顶部硬件监控条</AssemblyTitle>
-    <Description>在屏幕顶部正中用 1~2 行显示 CPU/GPU 温度与占用、内存与显存、网速、刷新率与实时帧率，数据可自选，鼠标穿透不挡操作。</Description>
+    <Description>在屏幕顶部正中用 1~2 行显示 CPU/GPU 温度与占用、内存与显存、网速、刷新率与实时帧率，数据可自选，背景可调至全透明，鼠标穿透不挡操作。</Description>
     <Company>SysMonitorBar</Company>
     <Copyright>MIT Licensed</Copyright>
     <RepositoryUrl>https://github.com/leerogerstheman/SysMonitorBar</RepositoryUrl>

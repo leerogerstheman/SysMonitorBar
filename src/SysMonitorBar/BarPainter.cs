@@ -1,11 +1,40 @@
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
+using System.Runtime.InteropServices;
 
 namespace SysMonitorBar;
 
 /// <summary>悬浮条的排版与绘制，OverlayForm 与设置界面预览共用。</summary>
 public static class BarPainter
 {
+    // 支持逐像素 alpha 的排版格式：GenericTypographic 去掉 GDI+ 默认的额外内边距，
+    // 让 DrawString 的落点与 MeasureString 的宽度自洽。
+    private static readonly StringFormat Typo = new(StringFormat.GenericTypographic)
+    {
+        FormatFlags = StringFormatFlags.NoWrap | StringFormatFlags.NoClip | StringFormatFlags.MeasureTrailingSpaces,
+        Trimming = StringTrimming.None,
+    };
+
+    // 缓存一块 1x1 的 PArgb 位图，用来把任意 alpha 的文字先画进去再合成，
+    // 避免 GDI+ 在低 alpha 下直接 DrawString 时出现的描边偏差。
+    private static readonly Dictionary<(int, int), SolidBrush> BrushCache = new();
+
+    private static SolidBrush Brush(Color c)
+    {
+        var key = (c.ToArgb(), 0);
+        if (!BrushCache.TryGetValue(key, out var b))
+        {
+            if (BrushCache.Count > 256) { foreach (var v in BrushCache.Values) v.Dispose(); BrushCache.Clear(); }
+            b = new SolidBrush(c);
+            BrushCache[key] = b;
+        }
+        else if (b.Color.ToArgb() != c.ToArgb())
+        {
+            b.Color = c;
+        }
+        return b;
+    }
+
     public static List<List<MetricCatalog.Run>> BuildLines(AppConfig cfg, Snapshot snap)
     {
         int maxLine = 0;
@@ -50,8 +79,10 @@ public static class BarPainter
     public static int MeasureRunWidth(Graphics g, Font font, string text)
     {
         if (string.IsNullOrEmpty(text)) return 0;
-        return TextRenderer.MeasureText(g, text, font, new Size(int.MaxValue, int.MaxValue),
-            TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix).Width;
+        // DrawString 在 GenericTypographic 下不会裁掉尾随空格，用 MeasureCharacterRanges
+        // 拿到的宽度比 MeasureString 更贴近实际落笔宽度。
+        var size = g.MeasureString(text, font, new PointF(0, 0), Typo);
+        return (int)Math.Ceiling(size.Width) + 1;
     }
 
     public static int MeasureLineWidth(Graphics g, Font font, List<MetricCatalog.Run> runs)
@@ -89,17 +120,34 @@ public static class BarPainter
         return p;
     }
 
+    /// <summary>按 globalAlpha(0~1) 缩放颜色的 alpha 通道。</summary>
+    private static Color Scale(Color c, double globalAlpha)
+    {
+        int a = (int)Math.Round(c.A * globalAlpha);
+        if (a < 0) a = 0;
+        if (a > 255) a = 255;
+        return Color.FromArgb(a, c.R, c.G, c.B);
+    }
+
+    /// <summary>
+    /// 绘制悬浮条内容。
+    /// <paramref name="globalAlpha"/> 为整体不透明度(0~1)，会同时作用于背景与文字；
+    /// 背景自身还能通过 <see cref="AppConfig.BackColor"/> 的 alpha 通道做到完全透明。
+    /// </summary>
     public static void Paint(Graphics g, Font font, AppConfig cfg, List<List<MetricCatalog.Run>> lines,
-        Rectangle bounds, bool opaqueBackground)
+        Rectangle bounds, double globalAlpha = 1.0)
     {
         g.SmoothingMode = SmoothingMode.AntiAlias;
-        g.TextRenderingHint = opaqueBackground ? TextRenderingHint.ClearTypeGridFit : TextRenderingHint.AntiAliasGridFit;
+        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+        // 背景可能是透明的，此时 ClearType 次像素抗锯齿会出彩边，只能用灰度抗锯齿。
+        g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
 
-        var back = cfg.Back;
-        var backColor = opaqueBackground ? back : Color.FromArgb(255, back.R, back.G, back.B);
-        int r = Math.Max(0, Math.Min(cfg.CornerRadius, Math.Min(bounds.Width, bounds.Height) / 2));
-        using (var brush = new SolidBrush(backColor))
+        var back = Scale(cfg.Back, globalAlpha);
+        if (back.A > 0 && bounds.Width > 0 && bounds.Height > 0)
         {
+            int r = Math.Max(0, Math.Min(cfg.CornerRadius, Math.Min(bounds.Width, bounds.Height) / 2));
+            using var brush = new SolidBrush(back);
             if (r > 0)
             {
                 using var path = RoundedPath(new Rectangle(bounds.X, bounds.Y, bounds.Width - 1, bounds.Height - 1), r);
@@ -108,9 +156,11 @@ public static class BarPainter
             else g.FillRectangle(brush, bounds);
         }
 
-        var textColor = cfg.Text;
-        var accentColor = cfg.Accent;
-        var sepColor = Color.FromArgb(120, textColor.R, textColor.G, textColor.B);
+        var textColor = Scale(cfg.Text, globalAlpha);
+        var accentColor = Scale(cfg.Accent, globalAlpha);
+        var sepColor = Scale(Color.FromArgb(120, cfg.Text.R, cfg.Text.G, cfg.Text.B), globalAlpha);
+
+        if (textColor.A == 0 && accentColor.A == 0) return;
 
         int y = bounds.Y + cfg.PaddingY;
         foreach (var line in lines)
@@ -125,8 +175,8 @@ public static class BarPainter
                 var color = run.Kind == MetricCatalog.RunKind.Label ? accentColor
                           : run.Kind == MetricCatalog.RunKind.Sep ? sepColor
                           : textColor;
-                TextRenderer.DrawText(g, run.Text, font, new Point(x, y), color,
-                    TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+                if (color.A > 0)
+                    g.DrawString(run.Text, font, Brush(color), x, y, Typo);
                 x += MeasureRunWidth(g, font, run.Text);
             }
             y += font.Height + cfg.LineSpacing;

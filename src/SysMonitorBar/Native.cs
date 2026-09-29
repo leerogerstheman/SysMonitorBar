@@ -1,4 +1,5 @@
-﻿using System.Runtime.InteropServices;
+using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
 
 namespace SysMonitorBar;
 
@@ -182,6 +183,97 @@ internal static class Native
         // 不要出现在 Alt+Tab
         ex &= ~0x00040000; // WS_EX_APPWINDOW
         SetStyle(hWnd, GWL_EXSTYLE, new IntPtr(ex));
+    }
+
+    // ---------------- 逐像素 alpha 分层窗口 ----------------
+    // 有了它才能让"背景透明、文字不透明"，这是 Form.Opacity（整窗均匀淡化）做不到的。
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct POINT { public int X, Y; public POINT(int x, int y) { X = x; Y = y; } }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SIZE { public int CX, CY; public SIZE(int w, int h) { CX = w; CY = h; } }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    private struct BLENDFUNCTION
+    {
+        public byte BlendOp;
+        public byte BlendFlags;
+        public byte SourceConstantAlpha;
+        public byte AlphaFormat;
+    }
+
+    private const byte AC_SRC_OVER = 0x00;
+    private const byte AC_SRC_ALPHA = 0x01;
+    private const int ULW_ALPHA = 0x02;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UpdateLayeredWindow(IntPtr hWnd, IntPtr hdcDst,
+        ref POINT pptDst, ref SIZE psize, IntPtr hdcSrc, ref POINT pptSrc,
+        int crKey, ref BLENDFUNCTION pblend, int dwFlags);
+
+    [DllImport("gdi32.dll", SetLastError = true)]
+    private static extern IntPtr CreateCompatibleDC(IntPtr hdc);
+
+    [DllImport("gdi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DeleteDC(IntPtr hdc);
+
+    [DllImport("gdi32.dll", SetLastError = true)]
+    private static extern IntPtr SelectObject(IntPtr hdc, IntPtr hObject);
+
+    [DllImport("gdi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DeleteObject(IntPtr hObject);
+
+    /// <summary>
+    /// 把一张 32bpp 预乘 alpha 的位图直接推给窗口合成器。
+    /// 注意：一旦对某个窗口调用过 UpdateLayeredWindow，该窗口就改由这里驱动绘制，
+    /// 系统不再发送 WM_PAINT，Form.Opacity / TransparencyKey 也会失效。
+    /// </summary>
+    public static bool PushLayeredBitmap(IntPtr hWnd, Bitmap bmp, int x, int y)
+    {
+        if (hWnd == IntPtr.Zero || bmp == null) return false;
+
+        IntPtr screenDc = IntPtr.Zero, memDc = IntPtr.Zero, hBitmap = IntPtr.Zero, oldBitmap = IntPtr.Zero;
+        try
+        {
+            screenDc = GetDC(IntPtr.Zero);
+            if (screenDc == IntPtr.Zero) return false;
+            memDc = CreateCompatibleDC(screenDc);
+            if (memDc == IntPtr.Zero) return false;
+
+            // 传 Color.FromArgb(0) 是关键：它保证 alpha=0 的像素保持全透明，
+            // 传 Color.Empty 会被 GDI 填成不透明黑，透明背景就废了。
+            hBitmap = bmp.GetHbitmap(Color.FromArgb(0));
+            oldBitmap = SelectObject(memDc, hBitmap);
+
+            var size = new SIZE(bmp.Width, bmp.Height);
+            var srcLoc = new POINT(0, 0);
+            var dstLoc = new POINT(x, y);
+            var blend = new BLENDFUNCTION
+            {
+                BlendOp = AC_SRC_OVER,
+                BlendFlags = 0,
+                SourceConstantAlpha = 255,
+                AlphaFormat = AC_SRC_ALPHA,
+            };
+
+            return UpdateLayeredWindow(hWnd, screenDc, ref dstLoc, ref size, memDc, ref srcLoc,
+                0, ref blend, ULW_ALPHA);
+        }
+        catch { return false; }
+        finally
+        {
+            if (hBitmap != IntPtr.Zero)
+            {
+                if (memDc != IntPtr.Zero && oldBitmap != IntPtr.Zero) SelectObject(memDc, oldBitmap);
+                DeleteObject(hBitmap);
+            }
+            if (memDc != IntPtr.Zero) DeleteDC(memDc);
+            if (screenDc != IntPtr.Zero) ReleaseDC(IntPtr.Zero, screenDc);
+        }
     }
 
     // ---------------- 置顶 ----------------

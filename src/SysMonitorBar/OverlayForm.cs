@@ -1,3 +1,6 @@
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+
 namespace SysMonitorBar;
 
 /// <summary>屏幕顶部正上方的 1~2 行硬件监控悬浮条。</summary>
@@ -9,8 +12,10 @@ public sealed class OverlayForm : Form
     private bool _dragging;
     private Point _dragStart;
     private int _dragOffsetX, _dragOffsetY;
-    private Size _lastSize = Size.Empty;
     private ContextMenuStrip _menu;
+
+    // 逐像素 alpha 的离屏画布
+    private Bitmap _layer;
 
     // 鼠标移入淡出
     private System.Windows.Forms.Timer _hoverTimer;
@@ -39,8 +44,11 @@ public sealed class OverlayForm : Form
         MaximizeBox = false;
         DoubleBuffered = true;
 
-        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint |
-                 ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        // 悬浮条完全由 UpdateLayeredWindow 推像素，WinForms 自己的绘制路径全部关掉，
+        // 否则它会用不透明的 BackColor 把透明区域刷掉。
+        SetStyle(ControlStyles.Opaque | ControlStyles.UserPaint, true);
+        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, false);
+        BackColor = Color.Black;
         UpdateStyles();
 
         BuildMenu();
@@ -107,23 +115,13 @@ public sealed class OverlayForm : Form
             if (_curOpacity != _targetOpacity)
             {
                 _curOpacity = _targetOpacity;
-                SetOpacity(_curOpacity);
+                Render();
             }
             return;
         }
         // 每 20ms 走 18%，大约 150ms 完成过渡
         _curOpacity += diff * 0.18;
-        SetOpacity(_curOpacity);
-    }
-
-    private void SetOpacity(double v)
-    {
-        try
-        {
-            v = Math.Max(0.0, Math.Min(1.0, v));
-            if (Math.Abs(Opacity - v) > 0.002) Opacity = v;
-        }
-        catch { }
+        Render();
     }
 
     protected override bool ShowWithoutActivation => true;
@@ -142,8 +140,10 @@ public sealed class OverlayForm : Form
             // ⚠ 关键：穿透位必须放进 CreateParams，不能只在建好窗口后 SetWindowLong。
             // WinForms 每次 UpdateStyles() / 重建句柄都会用 CreateParams 整体覆盖扩展样式，
             // 只在外面加一次的写法会被静默抹掉 —— 表现就是悬浮条挡住后面的窗口点不动。
-            if (Opacity < 1.0 || _clickThrough)
-                cp.ExStyle |= 0x00080000;   // WS_EX_LAYERED
+            //
+            // WS_EX_LAYERED 现在是无条件需要的：悬浮条走 UpdateLayeredWindow 逐像素 alpha，
+            // 没有这个位调用就会直接失败（表现为整条不显示）。
+            cp.ExStyle |= 0x00080000;   // WS_EX_LAYERED
             if (_clickThrough)
                 cp.ExStyle |= 0x00000020;   // WS_EX_TRANSPARENT 鼠标穿透
 
@@ -164,7 +164,7 @@ public sealed class OverlayForm : Form
             Native.SetClickThrough(Handle, on);
             if (changed)
             {
-                ApplyRegion();               // UpdateStyles 带 SWP_FRAMECHANGED，确认圆角还在
+                Render();                    // UpdateStyles 带 SWP_FRAMECHANGED，重推一帧确认内容还在
                 Native.BringToTop(Handle);
                 Log.Info($"[悬浮条] 鼠标穿透 = {on}  实际 ExStyle=0x{Native.GetExStyle(Handle):X8}");
             }
@@ -200,19 +200,15 @@ public sealed class OverlayForm : Form
         _snap = snap;
 
         EnsureFont();
-        _curOpacity = Math.Max(0.2, Math.Min(1.0, cfg.Opacity));
+        _curOpacity = Math.Max(0.05, Math.Min(1.0, cfg.Opacity));
         _targetOpacity = _curOpacity;
-        SetOpacity(_curOpacity);
-        // 背景必须是不透明色（整体透明度由 Opacity 控制），否则 WinForms 会抛异常
-        var b = cfg.Back;
-        BackColor = Color.FromArgb(255, b.R, b.G, b.B);
 
         if (IsHandleCreated)
             SetClickThrough(cfg.ClickThrough && !DragMode);
 
-        _lastSize = Size.Empty;
+        _wantSize = Size.Empty;   // 强制重新量一次尺寸（字号等参数可能变了）
         Relayout();
-        Invalidate();
+        Render();
     }
 
     public void SetDragMode(bool on)
@@ -225,7 +221,7 @@ public sealed class OverlayForm : Form
     {
         _snap = snap;
         Relayout();
-        Invalidate();
+        Render();
     }
 
     /// <summary>
@@ -250,6 +246,14 @@ public sealed class OverlayForm : Form
 
     private string _fontKey;
 
+    // 悬浮条"应该"有多大、在哪 —— 这是唯一的事实来源。
+    //
+    // 不能拿 WinForms 的 Width/Height/Left/Top 当准：UpdateLayeredWindow 会按我们推过去的
+    // 位图尺寸直接改窗口矩形，而 WinForms 缓存的 Bounds 不会跟着更新，两边一旦不一致就会
+    // 出现"背景板只画了半截、右边文字被裁掉"的情况。所以尺寸和位置全部自己记账。
+    private Size _wantSize = Size.Empty;
+    private Point _wantPos = Point.Empty;
+
     private void Relayout()
     {
         if (IsDisposed || !IsHandleCreated) return;
@@ -270,31 +274,74 @@ public sealed class OverlayForm : Form
         x = Math.Max(bounds.Left, Math.Min(x, bounds.Right - w));
         y = Math.Max(bounds.Top, Math.Min(y, bounds.Bottom - h));
 
-        var newSize = new Size(w, h);
-        if (newSize != _lastSize)
-        {
-            _lastSize = newSize;
-            SetBounds(x, y, w, h);
-            ApplyRegion();
-        }
-        else if (Left != x || Top != y)
-        {
-            Location = new Point(x, y);
-        }
+        _wantSize = new Size(w, h);
+        _wantPos = new Point(x, y);
+
+        // 位置和大小完全交给 UpdateLayeredWindow（见 Render()）。
+        //
+        // 这里刻意【不】调用 SetBounds：ULW 会按我们推过去的位图尺寸设置窗口矩形，
+        // 而 WinForms 缓存的 Bounds 不会同步。两边各设一次的结果就是窗口 746px、
+        // 底板只画 583px，表现为"背景板缺了左边一大块、文字挤在右边"。
+        // 让 ULW 当唯一的尺寸来源，两者就永远一致。
+        Render();
     }
 
-    private void ApplyRegion()
+    /// <summary>
+    /// 离屏画布：Format32bppPArgb（预乘 alpha）是 UpdateLayeredWindow 要求的格式。
+    /// 尺寸以 _wantSize 为准，不用 Width/Height（会被 ULW 改得跟 WinForms 缓存不一致）。
+    /// </summary>
+    private void EnsureLayer()
     {
-        int r = Math.Max(0, Math.Min(_cfg.CornerRadius, Math.Min(Width, Height) / 2));
-        if (r <= 0) { Region = null; return; }
-        using var path = BarPainter.RoundedPath(new Rectangle(0, 0, Width, Height), r);
-        Region = new Region(path);
+        int w = Math.Max(1, _wantSize.Width);
+        int h = Math.Max(1, _wantSize.Height);
+        if (_layer != null && _layer.Width == w && _layer.Height == h) return;
+        var old = _layer;
+        _layer = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
+        old?.Dispose();
+    }
+
+    /// <summary>
+    /// 把当前内容渲染成一张带透明通道的位图并推给合成器。
+    /// 整体不透明度(_curOpacity)在这里乘进每一个像素的 alpha —— 以前是交给 Form.Opacity，
+    /// 但那条路和 UpdateLayeredWindow 互斥，只能自己算。
+    /// </summary>
+    /// <returns>位图是否被合成器接受。</returns>
+    private bool Render()
+    {
+        if (IsDisposed || !IsHandleCreated) return false;
+        if (_wantSize.Width <= 0 || _wantSize.Height <= 0) return false;
+
+        try
+        {
+            EnsureLayer();
+            var lines = BarPainter.BuildLines(_cfg, _snap);
+
+            using (var g = Graphics.FromImage(_layer))
+            {
+                g.Clear(Color.Transparent);          // 先整张铺成全透明
+                g.CompositingMode = CompositingMode.SourceOver;
+                BarPainter.Paint(g, _font, _cfg, lines,
+                    new Rectangle(0, 0, _layer.Width, _layer.Height), _curOpacity);
+            }
+
+            return Native.PushLayeredBitmap(Handle, _layer, _wantPos.X, _wantPos.Y);
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("[悬浮条] 渲染失败: " + ex.Message);
+            return false;
+        }
     }
 
     protected override void OnPaint(PaintEventArgs e)
     {
-        var lines = BarPainter.BuildLines(_cfg, _snap);
-        BarPainter.Paint(e.Graphics, _font, _cfg, lines, ClientRectangle, true);
+        // UpdateLayeredWindow 之后系统不再让我们靠 WM_PAINT 出图，这里只是兜底。
+        Render();
+    }
+
+    protected override void OnPaintBackground(PaintEventArgs e)
+    {
+        // 不刷任何背景，否则会把透明区域涂黑。
     }
 
     // ---------------- 拖动 ----------------
@@ -317,7 +364,6 @@ public sealed class OverlayForm : Form
         var cur = Cursor.Position;
         _cfg.OffsetX = _dragOffsetX + (cur.X - _dragStart.X);
         _cfg.OffsetY = _dragOffsetY + (cur.Y - _dragStart.Y);
-        _lastSize = Size.Empty;
         Relayout();
     }
 
@@ -338,6 +384,10 @@ public sealed class OverlayForm : Form
         SetClickThrough(_cfg.ClickThrough && !DragMode);
         Native.BringToTop(Handle);
 
+        // 构造阶段还没有句柄，Relayout() 会直接返回，所以尺寸必须在这里补算一次。
+        // 漏掉这一步的表现是：窗口停在 WinForms 默认的 300x300，内容被裁掉一截。
+        Relayout();
+
         // 启动即自检，防止"穿透悄悄失效、用户点不动"这类问题再次蒙混过关
         bool ok = !_clickThrough || Native.IsClickThrough(Handle);
         Log.Info($"[悬浮条] 创建完成 期望穿透={_clickThrough} 实际={Native.IsClickThrough(Handle)} " +
@@ -349,6 +399,14 @@ public sealed class OverlayForm : Form
     {
         base.OnShown(e);
         Native.BringToTop(Handle);
+
+        // 首帧自检：推一次位图不等于它一定被合成器接受，这里把结果记下来，
+        // 免得出现"进程活着但屏幕上什么都没有"这种没有报错的失败。
+        bool pushed = Render();
+        Log.Info($"[悬浮条] 首帧渲染 {(pushed ? "成功" : "失败")}  尺寸={_wantSize.Width}x{_wantSize.Height}  " +
+                 $"位置={_wantPos.X},{_wantPos.Y}  背景=#{_cfg.BackColor}  " +
+                 $"整体不透明度={_curOpacity:0.00}  实际背景不透明度={_cfg.Back.A / 255.0:0.00}");
+        if (!pushed) Log.Error("[悬浮条] 首帧渲染失败，悬浮条可能不可见！");
     }
 
     protected override void Dispose(bool disposing)
@@ -358,6 +416,7 @@ public sealed class OverlayForm : Form
             _hoverTimer?.Stop(); _hoverTimer?.Dispose();
             _fadeTimer?.Stop(); _fadeTimer?.Dispose();
             _font?.Dispose();
+            _layer?.Dispose();
             _menu?.Dispose();
         }
         base.Dispose(disposing);
