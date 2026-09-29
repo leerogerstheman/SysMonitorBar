@@ -1,32 +1,53 @@
 # 顶部硬件监控条 (SysMonitorBar)
 
+**中文** ｜ [English](README.en.md)
+
 在屏幕**顶部正中**用 1~2 行显示实时硬件状态，数据全部自选，鼠标穿透、不挡操作。
 
-Windows 11 · .NET 8 · WinForms · 单文件小工具 · [MIT 协议](LICENSE)
+Windows 10/11 · .NET 8 · WinForms · [MIT 协议](LICENSE)
 
 ![效果图](docs/效果图.png)
 
-鼠标移到悬浮条上时会强烈淡化（下图，不透明度 15%）：
+```
+        CPU温度 48°C   CPU占用 14%   GPU温度 45°C   GPU占用 2%
+内存 12.3/31.8GB   显存 0.9/6.0GB   帧率 41FPS   ↓ 14.4 KB/s  ↑ 1.60 MB/s
+```
+
+## 它能做什么
+
+- **CPU**：温度（LibreHardwareMonitor 读 MSR，读不到时退回 ACPI 热区）、占用率、频率、功耗、风扇转速
+- **GPU**：温度、热点温度、占用率、功耗、风扇转速、显存占用 —— 走 NVAPI，**不需要管理员权限**
+- **内存 / 显存**：已用 / 总量、占用率
+- **网速**：实时上下行，自动挑流量最大的网卡（也可指定或全部合计）
+- **显示**：显示器刷新率，以及用 DXGI 桌面复制**实测**的实时帧率
+- **任意传感器**：LibreHardwareMonitor 枚举到的每个传感器（每核心频率、各路电压、主板温度、硬盘温度…）都能单独加到条上
+- **1~2 行随便排**：显示哪些数据、放第几行、什么顺序、叫什么名字、用什么模板格式，全部在设置界面里点几下搞定
+- **不挡操作**：默认鼠标穿透，点击直接透到后面的窗口；鼠标移到它上面时**强烈淡化**到 15%
+- **常驻托盘**：拖动定位、字号快捷增减、开机自启（提权时创建计划任务，**开机不再弹 UAC**）
+
+鼠标移到悬浮条上时会强烈淡化：
 
 ![鼠标移入淡化](docs/效果图-鼠标移入淡化.png)
-
-```
-        CPU占用 16%   GPU温度 44°C   GPU占用 18%
-内存 14.1/31.8GB   显存 0.9/6.0GB   帧率 59FPS   ↓ 4.4 KB/s  ↑ 9.5 KB/s
-```
 
 ---
 
 ## 快速开始
 
+**方式一：直接下载编译好的版本**（推荐，不用装 SDK）
+
+到 [Releases](https://github.com/leerogerstheman/SysMonitorBar/releases) 下载 ZIP，解压后双击 `启动-管理员.cmd`。
+需要先装 [.NET 8 桌面运行时](https://dotnet.microsoft.com/download/dotnet/8.0)（只装 Runtime，不用 SDK）。
+
+**方式二：从源码编译**
+
 ```bat
-git clone <本仓库>
+git clone https://github.com/leerogerstheman/SysMonitorBar.git
 cd SysMonitorBar
 build.cmd             :: 需要 .NET 8 SDK，脚本会自动找
 启动-管理员.cmd        :: 或 启动.cmd（不提权）
 ```
 
-`app\` 目录是编译产物，**不在仓库里**，所以第一次使用必须先跑一次 `build.cmd`。
+`app\` 目录是编译产物，**不在仓库里**，所以从源码走必须先跑一次 `build.cmd`。
 
 ---
 
